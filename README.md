@@ -1,277 +1,195 @@
 # Comlink
 
-Comlink makes [WebWorkers][webworker] enjoyable. Comlink is a **tiny library (1.1kB)**, that removes the mental barrier of thinking about `postMessage` and hides the fact that you are working with workers.
+Comlink makes worker threads enjoyable. It is a **dependency-free crate** that
+removes the mental barrier of thinking about message passing and hides the fact
+that you are working with another thread.
 
-At a more abstract level it is an RPC implementation for `postMessage` and [ES6 Proxies][es6 proxy].
+At a more abstract level it is an RPC implementation for channel endpoints.
 
+```toml
+[dependencies]
+comlink = "4.4"
 ```
-$ npm install --save comlink
-```
 
-![Comlink in action](https://user-images.githubusercontent.com/234957/54164510-cdab2d80-4454-11e9-92d0-7356aa6c5746.png)
-
-## Browsers support & bundle size
-
-![Chrome 56+](https://img.shields.io/badge/Chrome-56+-green.svg?style=flat-square)
-![Edge 15+](https://img.shields.io/badge/Edge-15+-green.svg?style=flat-square)
-![Firefox 52+](https://img.shields.io/badge/Firefox-52+-green.svg?style=flat-square)
-![Opera 43+](https://img.shields.io/badge/Opera-43+-green.svg?style=flat-square)
-![Safari 10.1+](https://img.shields.io/badge/Safari-10.1+-green.svg?style=flat-square)
-![Samsung Internet 6.0+](https://img.shields.io/badge/Samsung_Internet-6.0+-green.svg?style=flat-square)
-
-Browsers without [ES6 Proxy] support can use the [proxy-polyfill].
-
-**Size**: ~2.5k, ~1.2k gzip’d, ~1.1k brotli’d
+> **This crate is a migration.** It is a translation of
+> [GoogleChromeLabs/comlink][upstream] (TypeScript) at commit
+> `114a4a6448a855a613f1cb9a7c89290606c003cf`. See
+> [What changed on the way from TypeScript](#what-changed-on-the-way-from-typescript).
 
 ## Introduction
 
-On mobile phones, and especially on low-end mobile phones, it is important to keep the main thread as idle as possible so it can respond to user interactions quickly and provide a jank-free experience. **The UI thread ought to be for UI work only**. WebWorkers are a web API that allow you to run code in a separate thread. To communicate with another thread, WebWorkers offer the `postMessage` API. You can send JavaScript objects as messages using `myWorker.postMessage(someObject)`, triggering a `message` event inside the worker.
+Keeping the main thread idle matters: it should be free to respond to whatever
+the program's users are doing. Threads let you run code elsewhere, and channels
+let the two sides talk — but a channel gives you `post` and `recv`, not a value
+you can use.
 
-Comlink turns this messaged-based API into a something more developer-friendly by providing an RPC implementation: Values from one thread can be used within the other thread (and vice versa) just like local values.
+Comlink turns that message-based API into something friendlier: values from one
+thread can be used from the other almost like local values.
 
 ## Examples
 
-### [Running a simple function](./docs/examples/01-simple-example)
+### Running a simple function
 
-**main.js**
+```rust
+use std::sync::Arc;
+use comlink::{expose, wrap, Endpoint, Func, HostValue, MessageChannel, Origin};
 
-```javascript
-import * as Comlink from "https://unpkg.com/comlink/dist/esm/comlink.mjs";
-async function init() {
-  const worker = new Worker("worker.js");
-  // WebWorkers use `postMessage` and therefore work with Comlink.
-  const obj = Comlink.wrap(worker);
-  alert(`Counter: ${await obj.counter}`);
-  await obj.inc();
-  alert(`Counter: ${await obj.counter}`);
-}
-init();
+let chan = MessageChannel::new();
+chan.port1.start();
+chan.port2.start();
+
+// The far side exposes a function.
+expose(
+    Func::new(|args: Vec<HostValue>| {
+        let a = args[0].as_f64().unwrap_or(0.0);
+        let b = args[1].as_f64().unwrap_or(0.0);
+        Ok(HostValue::from(a + b))
+    }),
+    Arc::new(chan.port2.clone()) as Arc<dyn Endpoint>,
+    vec![Origin::Any],
+);
+
+// This side calls it.
+let remote = wrap(Arc::new(chan.port1.clone()) as Arc<dyn Endpoint>);
+assert_eq!(remote.call(vec![1.into(), 3.into()]).unwrap().as_f64(), Some(4.0));
 ```
 
-**worker.js**
+### Working with an object
 
-```javascript
-importScripts("https://unpkg.com/comlink/dist/umd/comlink.js");
-// importScripts("../../../dist/umd/comlink.js");
+```rust
+use comlink::{Obj, Value};
 
-const obj = {
-  counter: 0,
-  inc() {
-    this.counter++;
-  },
-};
+let obj = Obj::new();
+obj.put("counter", Value::Number(0.0));
+obj.put_method("inc", |_| Ok(HostValue::undefined()));
+expose(obj as Arc<dyn Host>, endpoint, vec![Origin::Any]);
 
-Comlink.expose(obj);
+// on the other side
+let counter = remote.get("counter").number()?;
+remote.call_method("inc", vec![])?;
 ```
 
-### [Callbacks](./docs/examples/02-callback-example)
+### Callbacks
 
-**main.js**
+A value cannot be cloned into another thread if it is a closure, so send a proxy
+instead:
 
-```javascript
-import * as Comlink from "https://unpkg.com/comlink/dist/esm/comlink.mjs";
-// import * as Comlink from "../../../dist/esm/comlink.mjs";
-function callback(value) {
-  alert(`Result: ${value}`);
-}
-async function init() {
-  const remoteFunction = Comlink.wrap(new Worker("worker.js"));
-  await remoteFunction(Comlink.proxy(callback));
-}
-init();
+```rust
+let callback = Func::new(|args| { /* ... */ Ok(HostValue::undefined()) });
+remote.call(vec![HostValue::Proxied(callback as Arc<dyn Host>)])?;
 ```
 
-**worker.js**
-
-```javascript
-importScripts("https://unpkg.com/comlink/dist/umd/comlink.js");
-// importScripts("../../../dist/umd/comlink.js");
-
-async function remoteFunction(cb) {
-  await cb("A string from a worker");
-}
-
-Comlink.expose(remoteFunction);
-```
-
-### [`SharedWorker`](./docs/examples/07-sharedworker-example)
-
-When using Comlink with a [`SharedWorker`](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker) you have to:
-
-1. Use the [`port`](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker/port) property, of the `SharedWorker` instance, when calling `Comlink.wrap`.
-2. Call `Comlink.expose` within the [`onconnect`](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorkerGlobalScope/onconnect) callback of the shared worker.
-
-**Pro tip:** You can access DevTools for any shared worker currently running in Chrome by going to: **chrome://inspect/#workers**
-
-**main.js**
-
-```javascript
-import * as Comlink from "https://unpkg.com/comlink/dist/esm/comlink.mjs";
-async function init() {
-  const worker = new SharedWorker("worker.js");
-  /**
-   * SharedWorkers communicate via the `postMessage` function in their `port` property.
-   * Therefore you must use the SharedWorker's `port` property when calling `Comlink.wrap`.
-   */
-  const obj = Comlink.wrap(worker.port);
-  alert(`Counter: ${await obj.counter}`);
-  await obj.inc();
-  alert(`Counter: ${await obj.counter}`);
-}
-init();
-```
-
-**worker.js**
-
-```javascript
-importScripts("https://unpkg.com/comlink/dist/umd/comlink.js");
-// importScripts("../../../dist/umd/comlink.js");
-
-const obj = {
-  counter: 0,
-  inc() {
-    this.counter++;
-  },
-};
-
-/**
- * When a connection is made into this shared worker, expose `obj`
- * via the connection `port`.
- */
-onconnect = function (event) {
-  const port = event.ports[0];
-
-  Comlink.expose(obj, port);
-};
-
-// Single line alternative:
-// onconnect = (e) => Comlink.expose(obj, e.ports[0]);
-```
-
-**For additional examples, please see the [docs/examples](./docs/examples) directory in the project.**
+Further worked examples live in [`examples/`](./examples): `simple`, `errors`,
+`classes`, `callback`, `transfer` and `create_endpoint`. Run one with
+`cargo run --example simple`.
 
 ## API
 
-### `Comlink.wrap(endpoint)` and `Comlink.expose(value, endpoint?, allowedOrigins?)`
+### `expose(value, endpoint, allowed_origins)` and `wrap(endpoint)`
 
-Comlink’s goal is to make _exposed_ values from one thread available in the other. `expose` exposes `value` on `endpoint`, where `endpoint` is a [`postMessage`-like interface][endpoint] and `allowedOrigins` is an array of
-RegExp or strings defining which origins should be allowed access (defaults to special case of `['*']` for all origins).
+`expose` publishes a value on an endpoint. `wrap` takes the *other* end and
+returns a [`Remote`]. Every access through the proxy is fallible and blocking:
+a call that returns a number returns `Result<HostValue, Thrown>`. Errors raised
+on the far side are re-raised here.
 
-`wrap` wraps the _other_ end of the message channel and returns a proxy. The proxy will have all properties and functions of the exposed value, but access and invocations are inherently asynchronous. This means that a function that returns a number will now return _a promise_ for a number. **As a rule of thumb: If you are using the proxy, put `await` in front of it.** Exceptions will be caught and re-thrown on the other side.
+`allowed_origins` filters by the origin stamped on incoming messages —
+`vec![Origin::Any]` is the permissive default the original uses.
 
-### `Comlink.transfer(value, transferables)` and `Comlink.proxy(value)`
+### Building a path
 
-By default, every function parameter, return value and object property value is copied, in the sense of [structured cloning]. Structured cloning can be thought of as deep copying, but has some limitations. See [this table][structured clone table] for details.
+There is no `Proxy` in Rust, so the path an access would have accumulated is
+built explicitly and sent by a terminal operation:
 
-If you want a value to be transferred rather than copied — provided the value is or contains a [`Transferable`][transferable] — you can wrap the value in a `transfer()` call and provide a list of transferable values:
+| TypeScript | Rust |
+|---|---|
+| `await remote.counter` | `remote.get("counter").value()?` |
+| `await remote.inc(1)` | `remote.call_method("inc", vec![1.into()])?` |
+| `remote.x = 4` | `remote.set("x", 4.into())?` |
+| `await new remote(a)` | `remote.construct(vec![a])?` |
+| `await remote[createEndpoint]()` | `remote.create_endpoint()?` |
+| `remote[releaseProxy]()` | `remote.release()` |
 
-```js
-const data = new Uint8Array([1, 2, 3, 4, 5]);
-await myProxy.someFunction(Comlink.transfer(data, [data.buffer]));
+### `transfer(value, transferables)` and `proxy(value)`
+
+By default every argument, return value and property is copied. Wrap a value in
+`transfer()` to move it instead — a transferred [`ArrayBuffer`] is detached on
+the sending side, and its `byte_length()` drops to zero.
+
+`proxy(value)` sends neither a copy nor the bytes, but a proxy: both sides work
+on the same value. This is what callbacks need.
+
+### Transfer handlers
+
+Register a [`TransferHandler`] under a name on **both** sides to customise how a
+value is serialised:
+
+```rust
+comlink::set_transfer_handler("event", Arc::new(MyEventHandler));
 ```
 
-Lastly, you can use `Comlink.proxy(value)`. When using this Comlink will neither copy nor transfer the value, but instead send a proxy. Both threads now work on the same value. This is useful for callbacks, for example, as functions are neither structured cloneable nor transferable.
+### `Host`
 
-```js
-myProxy.onready = Comlink.proxy((data) => {
-  /* ... */
-});
+Anything exposed implements [`Host`]: `get`, `set`, `apply`, `construct` and an
+optional `finalizer`. [`Obj`], [`Func`] and [`Class`] cover the usual cases;
+implement the trait directly for anything else.
+
+## What changed on the way from TypeScript
+
+Most of the library carried over unchanged: the wire protocol, the transfer
+handlers, the origin filter, the release and finalizer lifecycle, and the error
+semantics — including that a thrown scalar, `null` or plain object arrives as
+itself rather than being coerced into an error.
+
+Three things could not come across as they were:
+
+* **`Proxy`.** The original turns `await remote.a.b()` into a path plus a trap.
+  Rust cannot intercept field access, so the path is built explicitly. This is
+  the one place the API had to change shape.
+* **`Remote<T>` and `Local<T>`.** Those are conditional mapped types with no
+  runtime footprint. Rust has no equivalent, so [`Remote`] is a single concrete
+  type and the compile-time guarantees the original offered are not reproduced.
+* **`await`.** A call blocks the calling thread until the answer arrives. The
+  ordering guarantee is the same one a promise gives; the cost is a parked
+  thread instead of a suspended task.
+
+Two smaller differences worth knowing:
+
+* **`set` returns the protocol's answer, not the assigned value.** In JavaScript
+  `await (remote.x = 5)` evaluates to `5`, because an assignment *expression* has
+  the right-hand side as its value — comlink itself answers a `SET` with `true`.
+  `Remote::set` hands back that `true`. Nothing in the original's suite depends
+  on the difference.
+* **Error text for a call through a missing property differs.** The original
+  reports `Cannot read properties of undefined (reading 'f')`; this reports
+  `a.f is not a function`. Both are `TypeError`s, both reject, and both leave the
+  endpoint usable.
+
+Two things came out better:
+
+* **Release is deterministic.** The original releases an endpoint when a
+  `FinalizationRegistry` notices the last proxy was collected — best-effort, and
+  the matching test is `it.skip`ped because it depends on when a GC runs. Here
+  [`Remote`] is reference counted and `Drop` releases, so that test is a real
+  one.
+* **The wire format has no dead variants.** `WireValueType.PROXY` and
+  `WireValueType.THROW` are declared but never used upstream; they are not here.
+
+The structured-clone table has a Rust counterpart in
+[`structured-clone-table.md`](./structured-clone-table.md).
+
+## Tests
+
+```
+cargo test
 ```
 
-### Transfer handlers and event listeners
+The suite is a translation of the original's, case for case: `same_thread.rs`
+from `same_window.comlink.test.js`, `worker.rs` from `worker.comlink.test.js`,
+`thread_adapter.rs` from `tests/node/`, `origin_filter.rs` from
+`cross-origin.comlink.test.js`, and `cross_context.rs` from the two iframe
+suites.
 
-It is common that you want to use Comlink to add an event listener, where the event source is on another thread:
-
-```js
-button.addEventListener("click", myProxy.onClick.bind(myProxy));
-```
-
-While this won’t throw immediately, `onClick` will never actually be called. This is because [`Event`][event] is neither structured cloneable nor transferable. As a workaround, Comlink offers transfer handlers.
-
-Each function parameter and return value is given to _all_ registered transfer handlers. If one of the event handler signals that it can process the value by returning `true` from `canHandle()`, it is now responsible for serializing the value to structured cloneable data and for deserializing the value. A transfer handler has be set up on _both sides_ of the message channel. Here’s an example transfer handler for events:
-
-```js
-Comlink.transferHandlers.set("EVENT", {
-  canHandle: (obj) => obj instanceof Event,
-  serialize: (ev) => {
-    return [
-      {
-        target: {
-          id: ev.target.id,
-          classList: [...ev.target.classList],
-        },
-      },
-      [],
-    ];
-  },
-  deserialize: (obj) => obj,
-});
-```
-
-Note that this particular transfer handler won’t create an actual `Event`, but just an object that has the `event.target.id` and `event.target.classList` property. Often, this is enough. If not, the transfer handler can be easily augmented to provide all necessary data.
-
-### `Comlink.releaseProxy`
-
-Every proxy created by Comlink has the `[releaseProxy]()` method.
-Calling it will detach the proxy and the exposed object from the message channel, allowing both ends to be garbage collected.
-
-```js
-const proxy = Comlink.wrap(port);
-// ... use the proxy ...
-proxy[Comlink.releaseProxy]();
-```
-
-If the browser supports the [WeakRef proposal], `[releaseProxy]()` will be called automatically when the proxy created by `wrap()` gets garbage collected.
-
-### `Comlink.finalizer`
-
-If an exposed object has a property `[Comlink.finalizer]`, the property will be invoked as a function when the proxy is being released. This can happen either through a manual invocation of `[releaseProxy]()` or automatically during garbage collection if the runtime supports the [WeakRef proposal] (see `Comlink.releaseProxy` above). Note that when the finalizer function is invoked, the endpoint is closed and no more communication can happen.
-
-### `Comlink.createEndpoint`
-
-Every proxy created by Comlink has the `[createEndpoint]()` method.
-Calling it will return a new `MessagePort`, that has been hooked up to the same object as the proxy that `[createEndpoint]()` has been called on.
-
-```js
-const port = myProxy[Comlink.createEndpoint]();
-const newProxy = Comlink.wrap(port);
-```
-
-### `Comlink.windowEndpoint(window, context = self, targetOrigin = "*")`
-
-Windows and Web Workers have a slightly different variants of `postMessage`. If you want to use Comlink to communicate with an iframe or another window, you need to wrap it with `windowEndpoint()`.
-
-`window` is the window that should be communicate with. `context` is the `EventTarget` on which messages _from_ the `window` can be received (often `self`). `targetOrigin` is passed through to `postMessage` and allows to filter messages by origin. For details, see the documentation for [`Window.postMessage`](https://developer.mozilla.org/en-US/docs/Web/API/Window/postMessage).
-
-For a usage example, take a look at the non-worker examples in the `docs` folder.
-
-## TypeScript
-
-Comlink does provide TypeScript types. When you `expose()` something of type `T`, the corresponding `wrap()` call will return something of type `Comlink.Remote<T>`. While this type has been battle-tested over some time now, it is implemented on a best-effort basis. There are some nuances that are incredibly hard if not impossible to encode correctly in TypeScript’s type system. It _may_ sometimes be necessary to force a certain type using `as unknown as <type>`.
-
-## Node
-
-Comlink works with Node’s [`worker_threads`][worker_threads] module. Take a look at the example in the `docs` folder.
-
-[webworker]: https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API
-[umd]: https://github.com/umdjs/umd
-[transferable]: https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects
-[messageport]: https://developer.mozilla.org/en-US/docs/Web/API/MessagePort
-[examples]: https://github.com/GoogleChromeLabs/comlink/tree/master/docs/examples
-[dist]: https://github.com/GoogleChromeLabs/comlink/tree/master/dist
-[delivrjs]: https://cdn.jsdelivr.net/
-[es6 proxy]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Proxy
-[proxy-polyfill]: https://github.com/GoogleChrome/proxy-polyfill
-[endpoint]: src/protocol.ts
-[structured cloning]: https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm
-[structured clone table]: structured-clone-table.md
-[event]: https://developer.mozilla.org/en-US/docs/Web/API/Event
-[worker_threads]: https://nodejs.org/api/worker_threads.html
-[weakref proposal]: https://github.com/tc39/proposal-weakrefs
-
-## Additional Resources
-
-- [Simplify Web Worker code with Comlink](https://davidea.st/articles/comlink-simple-web-worker)
+[upstream]: https://github.com/GoogleChromeLabs/comlink
 
 ---
 

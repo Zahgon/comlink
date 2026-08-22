@@ -1,0 +1,16 @@
+[package]
+name = "comlink"
+version = "4.4.2"
+edition = "2021"
+rust-version = "1.70"
+description = "Comlink makes worker threads enjoyable -- an RPC implementation over message passing."
+license = "Apache-2.0"
+repository = "https://github.com/GoogleChromeLabs/comlink"
+readme = "README.md"
+
+# The TypeScript original ships with zero runtime dependencies; so does this.
+[dependencies]
+
+[lib]
+name = "comlink"
+path = "src/lib.rs"
